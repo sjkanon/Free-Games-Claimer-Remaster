@@ -5,11 +5,10 @@ from __future__ import annotations
 import json
 import logging
 
-import pyotp
-import nodriver as uc
 from tenacity import retry, stop_after_attempt, wait_exponential
 
-from src.core.claimer import BaseClaimer, OTP_KEY_ATTEMPTS, now_str
+from src.core.claimer import BaseClaimer, OTP_KEY_ATTEMPTS
+from src.core.redact import mask_code
 from src.core.config import cfg
 from src.core.database import async_session, get_or_create
 from src.core.url_security import url_has_allowed_host
@@ -17,6 +16,19 @@ from src.core.url_security import url_has_allowed_host
 logger = logging.getLogger("fgc.gog")
 
 URL_CLAIM = "https://www.gog.com/en"
+
+
+def is_gog_code(code: str, extra: str | None) -> bool:
+    """Tagged as GOG, or untagged and shaped like one (18 uppercase letters and digits); another store's code never is."""
+    try:
+        tag = str(json.loads(extra or "{}").get("external_store", "") or "").strip().lower()
+    except (TypeError, ValueError, AttributeError):
+        tag = ""
+    if "gog" in tag:
+        return True
+    code = str(code or "")
+    shaped = len(code) == 18 and code.isalnum() and code.isupper()
+    return shaped and tag in ("", "unknown")
 
 
 class GOGClaimer(BaseClaimer):
@@ -61,7 +73,6 @@ class GOGClaimer(BaseClaimer):
 
     async def _ensure_logged_in(self) -> bool:
         """Check if we are logged in to GOG. If not, try automatic login or wait for VNC."""
-        import json
         await self.sleep(3)  # Give GOG time to fully render the page
         
         # GOG shows a cookie consent popup (CookieBot) that blocks the page.
@@ -164,7 +175,6 @@ class GOGClaimer(BaseClaimer):
             await self.page.find("#login_username", timeout=15)
             await self.page.find("#login_login", timeout=5)
             
-            import json
             js_email = json.dumps(email)
             js_password = json.dumps(password)
 
@@ -435,9 +445,43 @@ class GOGClaimer(BaseClaimer):
         # GOG automatically subscribes you to their newsletter when you claim a game.
         # If the user hasn't opted in (GOG_NEWSLETTER=0), unsubscribe automatically.
         if status == "claimed" and not cfg.gog_newsletter:
-            logger.debug("Unsubscribing from newsletter")
-            await self.page.get("https://www.gog.com/en/account/settings/subscriptions")
-            await self.sleep(3)
+            await self._unsubscribe_newsletter()  # [fork:fix] the page was opened but nothing was unticked
+
+    # [fork:fix] begin – untick GOG's marketing newsletters (as vogler/free-games-claimer did).
+    NEWSLETTERS = ("Promotions and hot deals", "Marketing communications through Trusted Partners")
+
+    async def _unsubscribe_newsletter(self) -> None:
+        logger.debug("Unsubscribing from newsletter")
+        await self.page.get("https://www.gog.com/en/account/settings/subscriptions")
+        await self.sleep(4)
+        script = '''
+            (() => {
+                const names = %s;
+                const out = {unticked: [], already: [], missing: []};
+                for (const name of names) {
+                    const row = Array.from(document.querySelectorAll('li, label, div'))
+                        .filter(el => el.textContent && el.textContent.includes(name) && el.querySelector('input[type=checkbox]'))
+                        .sort((a, b) => a.textContent.length - b.textContent.length)[0];
+                    const box = row && row.querySelector('input[type=checkbox]');
+                    if (!box) { out.missing.push(name); continue; }
+                    if (!box.checked) { out.already.push(name); continue; }
+                    (box.closest('label') || row.querySelector('label') || box).click();
+                    out.unticked.push(name);
+                }
+                return JSON.stringify(out);
+            })()
+        ''' % json.dumps(list(self.NEWSLETTERS))
+        try:
+            result = json.loads(await self.page.evaluate(script) or "{}")
+        except (json.JSONDecodeError, TypeError) as exc:
+            logger.warning("Could not read GOG's newsletter settings: %s", exc)
+            return
+        await self.sleep(2)
+        if result.get("unticked"):
+            logger.info("GOG newsletter unsubscribed: %s", ", ".join(result["unticked"]))
+        if result.get("missing"):
+            logger.warning("GOG newsletter option not found (page changed?): %s", ", ".join(result["missing"]))
+    # [fork:fix] end
 
     async def redeem_pending_codes(self) -> None:
         """Find GOG codes from Prime Gaming that haven't been redeemed yet, and redeem them."""
@@ -470,26 +514,13 @@ class GOGClaimer(BaseClaimer):
         if old_games:
             logger.debug("Checking for pending GOG codes: %d total external codes in DB", len(old_games))
         
-        import json
         # Filter the results to only include GOG codes (not Legacy Games, Epic, etc.)
         gog_games = []
         for g in old_games:
-            is_gog = False
-            # Check the "extra" JSON field for the external store identifier
-            if g.extra:
-                try:
-                    ext_store = json.loads(g.extra).get("external_store", "")
-                    if "gog" in ext_store.lower():
-                        is_gog = True
-                except Exception:
-                    pass
-            
-            # A GOG code is either explicitly tagged as GOG, or matches the pattern:
-            # exactly 18 uppercase alphanumeric characters with no hyphens
-            if is_gog or (len(g.code) == 18 and "-" not in g.code and g.code.isalnum() and g.code.isupper()):
+            if is_gog_code(g.code, g.extra):
                 gog_games.append(g)
             else:
-                logger.debug("Skipped non-GOG code: '%s' code=%s extra=%s", g.title, g.code, g.extra)
+                logger.debug("Skipped non-GOG code: '%s' code=%s extra=%s", g.title, mask_code(g.code), g.extra)
 
         if not gog_games:
             # Silent exit if nothing to do
@@ -519,7 +550,7 @@ class GOGClaimer(BaseClaimer):
         # GOG has a direct redemption URL: gog.com/redeem/XXXXXXXXXXXXX
         # Force English locale via /en/ path to get predictable button labels
         redeem_url = f"https://www.gog.com/en/redeem/{code}"
-        logger.info("Redeeming GOG code for '%s' at %s", title, redeem_url)
+        logger.info("Redeeming GOG code %s for '%s'.", mask_code(code), title)
 
         try:
             await self.page.get(redeem_url)
@@ -534,7 +565,7 @@ class GOGClaimer(BaseClaimer):
                     return isinstance(cur, str) and "redeem" in cur
                 logged_in = await self._wait_for_vnc_login(_gog_logged_in)
                 if not logged_in:
-                    logger.warning("GOG login timed out – code not redeemed: %s", code)
+                    logger.warning("GOG login timed out – code not redeemed: %s", mask_code(code))
                     self.notify_games.append({"title": title, "url": url, "status": f"code: {code} (GOG, not redeemed)"})
                     return
 
@@ -560,6 +591,11 @@ class GOGClaimer(BaseClaimer):
                 })()
             """)
             await self.sleep(1)
+
+            if cfg.dryrun:
+                logger.info("DRYRUN – skipped redeeming '%s' on GOG.", title)
+                self.notify_games.append({"title": title, "url": redeem_url, "status": "available (dry run)"})
+                return
 
             # Click the "Continue" button on the redemption page.
             # We use JavaScript to find and click it because GOG has overlay elements
@@ -650,7 +686,7 @@ class GOGClaimer(BaseClaimer):
                 logger.warning("GOG still says the code for '%s' is being redeemed, it stays pending for the next run.",
                                title)
             else:
-                logger.warning("GOG redeem result unclear for '%s'. Code: %s", title, code)
+                logger.warning("GOG redeem result unclear for '%s'. Code: %s", title, mask_code(code))
                 self.notify_games.append({"title": title, "url": redeem_url, "status": f"code: {code} (GOG, check manually)"})
 
         except Exception:
